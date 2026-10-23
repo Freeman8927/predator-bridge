@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+import uuid
 
 app = FastAPI()
 
@@ -12,8 +13,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# This holds the live data in memory
+# Holds the live data in memory
 LIVE_DATA = {"accounts": {}, "timestamp": ""}
+ACTIVE_ALERTS = []
+PENDING_COMMANDS = []
 
 @app.post("/api/webhook")
 async def receive_data(request: Request):
@@ -30,6 +33,45 @@ async def receive_data(request: Request):
 @app.get("/api/data")
 async def get_data():
     return {"status": "ok", **LIVE_DATA}
+
+@app.post("/api/alerts")
+async def create_alert(request: Request):
+    data = await request.json()
+    if data and "symbol" in data and "price" in data and "condition" in data:
+        new_alert = {
+            "id": str(uuid.uuid4()),
+            "symbol": data["symbol"].upper(),
+            "price": float(data["price"]),
+            "condition": data["condition"],
+            "created_at": datetime.utcnow().isoformat()
+        }
+        ACTIVE_ALERTS.append(new_alert)
+        return {"status": "ok", "alert": new_alert}
+    return {"status": "error", "message": "Invalid payload"}
+
+@app.get("/api/alerts")
+async def get_alerts():
+    return {"alerts": ACTIVE_ALERTS}
+
+@app.delete("/api/alerts/{alert_id}")
+async def delete_alert(alert_id: str):
+    global ACTIVE_ALERTS
+    ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["id"] != alert_id]
+    return {"status": "deleted"}
+
+@app.post("/api/command")
+async def send_command(request: Request):
+    data = await request.json()
+    if data and "command" in data:
+        PENDING_COMMANDS.append(data["command"])
+    return {"status": "queued"}
+
+@app.get("/api/commands")
+async def get_commands():
+    global PENDING_COMMANDS
+    cmds = PENDING_COMMANDS.copy()
+    PENDING_COMMANDS.clear() 
+    return {"commands": cmds}
 
 @app.get("/")
 def health_check():
