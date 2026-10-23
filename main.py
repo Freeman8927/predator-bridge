@@ -5,7 +5,6 @@ import uuid
 
 app = FastAPI()
 
-# Allow your web app to fetch this data
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,26 +12,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Holds the live data in memory
 LIVE_DATA = {"accounts": {}, "timestamp": ""}
 ACTIVE_ALERTS = []
 PENDING_COMMANDS = []
+VPS_LAST_SEEN = ""  # <--- NEW HANDSHAKE VARIABLE
 
 @app.post("/api/webhook")
 async def receive_data(request: Request):
-    global LIVE_DATA
+    global LIVE_DATA, VPS_LAST_SEEN
     data = await request.json()
     account_id = str(data.get("accountId"))
     
     if account_id:
         LIVE_DATA["accounts"][account_id] = data
         LIVE_DATA["timestamp"] = datetime.utcnow().isoformat()
+        VPS_LAST_SEEN = datetime.utcnow().isoformat() # <--- UPDATE HANDSHAKE
         
     return {"status": "ok"}
 
 @app.get("/api/data")
 async def get_data():
-    return {"status": "ok", **LIVE_DATA}
+    # Return the handshake timestamp to the web app
+    return {"status": "ok", "vps_last_seen": VPS_LAST_SEEN, **LIVE_DATA}
 
 @app.post("/api/alerts")
 async def create_alert(request: Request):
@@ -43,7 +44,7 @@ async def create_alert(request: Request):
             "symbol": data["symbol"].upper(),
             "price": float(data["price"]),
             "condition": data["condition"],
-            "note": data.get("note", ""), # <--- ADDED NOTE HERE
+            "note": data.get("note", ""),
             "created_at": datetime.utcnow().isoformat()
         }
         ACTIVE_ALERTS.append(new_alert)
