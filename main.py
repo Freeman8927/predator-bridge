@@ -43,6 +43,7 @@ async def create_alert(request: Request):
             "symbol": data["symbol"].upper(),
             "price": float(data["price"]),
             "condition": data["condition"],
+            "note": data.get("note", ""), # <--- ADDED NOTE HERE
             "created_at": datetime.utcnow().isoformat()
         }
         ACTIVE_ALERTS.append(new_alert)
