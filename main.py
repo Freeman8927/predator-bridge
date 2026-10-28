@@ -1,13 +1,19 @@
+"""
+================================================================================
+Market Predator — Render Cloud Bridge (FastAPI)
+================================================================================
+"""
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import uuid
 
-app = FastAPI()
+app = FastAPI(title="Market Predator Cloud Bridge")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -17,28 +23,105 @@ ACTIVE_ALERTS = []
 PENDING_COMMANDS = []
 VPS_LAST_SEEN = ""
 
+CHART_DATA = {
+    "symbol": "XAUUSD",
+    "candles": [],
+    "visuals": {
+        "symbol": "XAUUSD",
+        "trendline": {"level": 0.0, "type": "NONE", "color": "#a855f7"},
+        "killzones": [
+            {"name": "Asian Killzone", "start": "02:00", "end": "05:00", "active": False},
+            {"name": "London Killzone", "start": "08:00", "end": "11:00", "active": False},
+            {"name": "New York Killzone", "start": "13:00", "end": "16:00", "active": False}
+        ]
+    },
+    "updated_at": ""
+}
+
+# 1. Telemetry Webhook
 @app.post("/api/webhook")
 async def receive_data(request: Request):
     global LIVE_DATA, VPS_LAST_SEEN
     data = await request.json()
     account_id = str(data.get("accountId"))
-    
-    # Ignore heartbeat pings from showing up as real accounts
     if account_id == "heartbeat":
         VPS_LAST_SEEN = datetime.utcnow().isoformat()
         return {"status": "ok"}
-    
     if account_id:
         LIVE_DATA["accounts"][account_id] = data
         LIVE_DATA["timestamp"] = datetime.utcnow().isoformat()
         VPS_LAST_SEEN = datetime.utcnow().isoformat()
-        
     return {"status": "ok"}
 
 @app.get("/api/data")
 async def get_data():
     return {"status": "ok", "vps_last_seen": VPS_LAST_SEEN, **LIVE_DATA}
 
+# 2. Live Chart Streaming
+@app.post("/api/update_chart")
+@app.post("/api/update_visuals")
+async def update_chart(request: Request):
+    global CHART_DATA
+    try:
+        data = await request.json()
+        if data:
+            if "symbol" in data:
+                CHART_DATA["symbol"] = data["symbol"]
+            if "candles" in data and isinstance(data["candles"], list):
+                CHART_DATA["candles"] = data["candles"]
+            if "visuals" in data and isinstance(data["visuals"], dict):
+                CHART_DATA["visuals"] = data["visuals"]
+            elif "trendline" in data:
+                CHART_DATA["visuals"]["trendline"] = {
+                    "level": data.get("level", 0.0),
+                    "type": data.get("type", "NONE"),
+                    "color": "#10b981" if data.get("type") == "BULLISH" else "#a855f7"
+                }
+            CHART_DATA["updated_at"] = datetime.utcnow().isoformat()
+        return {"status": "ok", "candles_count": len(CHART_DATA["candles"])}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/chart_data")
+async def get_chart_data(symbol: str = "XAUUSD"):
+    return {
+        "status": "ok",
+        "symbol": CHART_DATA.get("symbol", symbol),
+        "candles": CHART_DATA.get("candles", []),
+        "visuals": CHART_DATA.get("visuals", {}),
+        "updated_at": CHART_DATA.get("updated_at", ""),
+        "online": bool(CHART_DATA.get("candles"))
+    }
+
+# 3. Direct Trade Execution
+@app.post("/api/execute_trade")
+async def execute_trade(request: Request):
+    global PENDING_COMMANDS
+    try:
+        data = await request.json()
+        trade_cmd = {
+            "id": f"trade_{uuid.uuid4().hex[:8]}",
+            "action": data.get("action", "BUY").upper(),
+            "symbol": data.get("symbol", "XAUUSD").upper(),
+            "lots": float(data.get("lots", 0.01)),
+            "timestamp": data.get("timestamp", datetime.utcnow().isoformat())
+        }
+        PENDING_COMMANDS.append(trade_cmd)
+        return {"status": "queued", "trade": trade_cmd}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/pending_trade")
+async def get_pending_trade():
+    global PENDING_COMMANDS
+    trade = None
+    for i, cmd in enumerate(PENDING_COMMANDS):
+        if isinstance(cmd, dict) and cmd.get("action") in ("BUY", "SELL", "QUICK_BUY", "QUICK_SELL"):
+            trade = PENDING_COMMANDS.pop(i)
+            break
+    return {"trade": trade}
+
+# 4. Alerts & Commands
 @app.post("/api/alerts")
 async def create_alert(request: Request):
     data = await request.json()
@@ -76,9 +159,16 @@ async def send_command(request: Request):
 async def get_commands():
     global PENDING_COMMANDS
     cmds = PENDING_COMMANDS.copy()
-    PENDING_COMMANDS.clear() 
+    PENDING_COMMANDS.clear()
     return {"commands": cmds}
 
+@app.get("/ping")
+@app.get("/health")
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "FastAPI Bridge"}
+    return {
+        "status": "running",
+        "service": "Market Predator Cloud Bridge",
+        "vps_last_seen": VPS_LAST_SEEN,
+        "candles_cached": len(CHART_DATA.get("candles", []))
+    }
