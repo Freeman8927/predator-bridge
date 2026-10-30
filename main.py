@@ -1,8 +1,3 @@
-"""
-================================================================================
-Market Predator — Render Cloud Bridge (FastAPI)
-================================================================================
-"""
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
@@ -23,7 +18,7 @@ ACTIVE_ALERTS = []
 PENDING_COMMANDS = []
 VPS_LAST_SEEN = ""
 
-# NEW: Global state to store the user's chart selection
+# The config stores what the user selected on the web app
 CHART_CONFIG = {
     "symbol": "XAUUSD",
     "timeframe": "M5",
@@ -32,47 +27,60 @@ CHART_CONFIG = {
 
 CHART_DATA = {
     "symbol": "XAUUSD",
+    "timeframe": "M5", # Added timeframe
     "candles": [],
-    "visuals": {
-        "symbol": "XAUUSD",
-        "trendline": {"level": 0.0, "type": "NONE", "color": "#a855f7"},
-        "killzones": [
-            {"name": "Asian Killzone", "start": "02:00", "end": "05:00", "active": False},
-            {"name": "London Killzone", "start": "08:00", "end": "11:00", "active": False},
-            {"name": "New York Killzone", "start": "13:00", "end": "16:00", "active": False}
-        ]
-    },
+    "visuals": {},
     "updated_at": ""
 }
 
-# ==============================================================================
-# CHART CONFIGURATION (New)
-# ==============================================================================
+# 1. The VPS polls this to know what to fetch
+@app.get("/api/chart_config")
+async def get_chart_config():
+    return CHART_CONFIG
+
+# 2. The Web App posts this when you change the dropdown
 @app.post("/api/set_chart_config")
 async def set_chart_config(request: Request):
-    """Called by the Web App when the user changes symbol, timeframe, or account."""
     global CHART_CONFIG
     try:
         data = await request.json()
         CHART_CONFIG["symbol"] = data.get("symbol", "XAUUSD")
         CHART_CONFIG["timeframe"] = data.get("timeframe", "M5")
         CHART_CONFIG["accountId"] = data.get("accountId", "MASTER")
-        
-        print(f"📥 [RENDER] Updated Chart Config -> {CHART_CONFIG['symbol']} {CHART_CONFIG['timeframe']} (Acc: {CHART_CONFIG['accountId']})")
-        
+        print(f"📥 [RENDER] Updated Config -> {CHART_CONFIG}")
         return {"status": "ok", "config": CHART_CONFIG}
     except Exception as e:
-        print(f"❌ [RENDER ERROR] Failed to set config: {e}")
         return {"status": "error", "message": str(e)}
 
-@app.get("/api/chart_config")
-async def get_chart_config():
-    """Called by the VPS Python Bridge to know what data to fetch."""
-    return CHART_CONFIG
+# 3. The VPS pushes data here
+@app.post("/api/update_chart")
+async def update_chart(request: Request):
+    global CHART_DATA
+    try:
+        data = await request.json()
+        if "symbol" in data: CHART_DATA["symbol"] = data["symbol"]
+        if "timeframe" in data: CHART_DATA["timeframe"] = data["timeframe"]
+        if "candles" in data and isinstance(data["candles"], list):
+            CHART_DATA["candles"] = data["candles"]
+        if "visuals" in data: CHART_DATA["visuals"] = data["visuals"]
+        CHART_DATA["updated_at"] = datetime.utcnow().isoformat()
+        return {"status": "ok", "candles_count": len(CHART_DATA["candles"])}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-# ==============================================================================
-# TELEMETRY & CHART DATA
-# ==============================================================================
+# 4. The Web App fetches data here
+@app.get("/api/chart_data")
+async def get_chart_data():
+    return {
+        "status": "ok",
+        "symbol": CHART_DATA.get("symbol", "XAUUSD"),
+        "timeframe": CHART_DATA.get("timeframe", "M5"),
+        "candles": CHART_DATA.get("candles", []),
+        "visuals": CHART_DATA.get("visuals", {}),
+        "online": bool(CHART_DATA.get("candles"))
+    }
+
+# Remaining endpoints (Telemetry, Trade, Alerts)
 @app.post("/api/webhook")
 async def receive_data(request: Request):
     global LIVE_DATA, VPS_LAST_SEEN
@@ -83,7 +91,6 @@ async def receive_data(request: Request):
         return {"status": "ok"}
     if account_id:
         LIVE_DATA["accounts"][account_id] = data
-        LIVE_DATA["timestamp"] = datetime.utcnow().isoformat()
         VPS_LAST_SEEN = datetime.utcnow().isoformat()
     return {"status": "ok"}
 
@@ -91,60 +98,19 @@ async def receive_data(request: Request):
 async def get_data():
     return {"status": "ok", "vps_last_seen": VPS_LAST_SEEN, **LIVE_DATA}
 
-@app.post("/api/update_chart")
-@app.post("/api/update_visuals")
-async def update_chart(request: Request):
-    global CHART_DATA
-    try:
-        data = await request.json()
-        if data:
-            if "symbol" in data:
-                CHART_DATA["symbol"] = data["symbol"]
-            if "candles" in data and isinstance(data["candles"], list):
-                CHART_DATA["candles"] = data["candles"]
-            if "visuals" in data and isinstance(data["visuals"], dict):
-                CHART_DATA["visuals"] = data["visuals"]
-            elif "trendline" in data:
-                CHART_DATA["visuals"]["trendline"] = {
-                    "level": data.get("level", 0.0),
-                    "type": data.get("type", "NONE"),
-                    "color": "#10b981" if data.get("type") == "BULLISH" else "#a855f7"
-                }
-            CHART_DATA["updated_at"] = datetime.utcnow().isoformat()
-        return {"status": "ok", "candles_count": len(CHART_DATA["candles"])}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/api/chart_data")
-async def get_chart_data(symbol: str = "XAUUSD"):
-    return {
-        "status": "ok",
-        "symbol": CHART_DATA.get("symbol", symbol),
-        "candles": CHART_DATA.get("candles", []),
-        "visuals": CHART_DATA.get("visuals", {}),
-        "updated_at": CHART_DATA.get("updated_at", ""),
-        "online": bool(CHART_DATA.get("candles"))
-    }
-
-# ==============================================================================
-# TRADE EXECUTION
-# ==============================================================================
 @app.post("/api/execute_trade")
 async def execute_trade(request: Request):
     global PENDING_COMMANDS
-    try:
-        data = await request.json()
-        trade_cmd = {
-            "id": f"trade_{uuid.uuid4().hex[:8]}",
-            "action": data.get("action", "BUY").upper(),
-            "symbol": data.get("symbol", "XAUUSD").upper(),
-            "lots": float(data.get("lots", 0.01)),
-            "timestamp": data.get("timestamp", datetime.utcnow().isoformat())
-        }
-        PENDING_COMMANDS.append(trade_cmd)
-        return {"status": "queued", "trade": trade_cmd}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    data = await request.json()
+    trade_cmd = {
+        "id": f"trade_{uuid.uuid4().hex[:8]}",
+        "action": data.get("action", "BUY").upper(),
+        "symbol": data.get("symbol", "XAUUSD").upper(),
+        "lots": float(data.get("lots", 0.01)),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    PENDING_COMMANDS.append(trade_cmd)
+    return {"status": "queued", "trade": trade_cmd}
 
 @app.get("/api/pending_trade")
 async def get_pending_trade():
@@ -156,56 +122,8 @@ async def get_pending_trade():
             break
     return {"trade": trade}
 
-# ==============================================================================
-# ALERTS & COMMANDS
-# ==============================================================================
-@app.post("/api/alerts")
-async def create_alert(request: Request):
-    data = await request.json()
-    if data and "symbol" in data and "price" in data and "condition" in data:
-        new_alert = {
-            "id": str(uuid.uuid4()),
-            "symbol": data["symbol"].upper(),
-            "price": float(data["price"]),
-            "condition": data["condition"],
-            "note": data.get("note", ""),
-            "created_at": datetime.utcnow().isoformat()
-        }
-        ACTIVE_ALERTS.append(new_alert)
-        return {"status": "ok", "alert": new_alert}
-    return {"status": "error", "message": "Invalid payload"}
-
-@app.get("/api/alerts")
-async def get_alerts():
-    return {"alerts": ACTIVE_ALERTS}
-
-@app.delete("/api/alerts/{alert_id}")
-async def delete_alert(alert_id: str):
-    global ACTIVE_ALERTS
-    ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["id"] != alert_id]
-    return {"status": "deleted"}
-
-@app.post("/api/command")
-async def send_command(request: Request):
-    data = await request.json()
-    if data and "command" in data:
-        PENDING_COMMANDS.append(data["command"])
-    return {"status": "queued"}
-
-@app.get("/api/commands")
-async def get_commands():
-    global PENDING_COMMANDS
-    cmds = PENDING_COMMANDS.copy()
-    PENDING_COMMANDS.clear()
-    return {"commands": cmds}
-
 @app.get("/ping")
 @app.get("/health")
 @app.get("/")
 def health_check():
-    return {
-        "status": "running",
-        "service": "Market Predator Cloud Bridge",
-        "vps_last_seen": VPS_LAST_SEEN,
-        "candles_cached": len(CHART_DATA.get("candles", []))
-    }
+    return {"status": "running", "candles_cached": len(CHART_DATA.get("candles", []))}
