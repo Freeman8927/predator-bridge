@@ -23,6 +23,13 @@ ACTIVE_ALERTS = []
 PENDING_COMMANDS = []
 VPS_LAST_SEEN = ""
 
+# NEW: Global state to store the user's chart selection
+CHART_CONFIG = {
+    "symbol": "XAUUSD",
+    "timeframe": "M5",
+    "accountId": "MASTER"
+}
+
 CHART_DATA = {
     "symbol": "XAUUSD",
     "candles": [],
@@ -38,7 +45,34 @@ CHART_DATA = {
     "updated_at": ""
 }
 
-# 1. Telemetry Webhook
+# ==============================================================================
+# CHART CONFIGURATION (New)
+# ==============================================================================
+@app.post("/api/set_chart_config")
+async def set_chart_config(request: Request):
+    """Called by the Web App when the user changes symbol, timeframe, or account."""
+    global CHART_CONFIG
+    try:
+        data = await request.json()
+        CHART_CONFIG["symbol"] = data.get("symbol", "XAUUSD")
+        CHART_CONFIG["timeframe"] = data.get("timeframe", "M5")
+        CHART_CONFIG["accountId"] = data.get("accountId", "MASTER")
+        
+        print(f"📥 [RENDER] Updated Chart Config -> {CHART_CONFIG['symbol']} {CHART_CONFIG['timeframe']} (Acc: {CHART_CONFIG['accountId']})")
+        
+        return {"status": "ok", "config": CHART_CONFIG}
+    except Exception as e:
+        print(f"❌ [RENDER ERROR] Failed to set config: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/chart_config")
+async def get_chart_config():
+    """Called by the VPS Python Bridge to know what data to fetch."""
+    return CHART_CONFIG
+
+# ==============================================================================
+# TELEMETRY & CHART DATA
+# ==============================================================================
 @app.post("/api/webhook")
 async def receive_data(request: Request):
     global LIVE_DATA, VPS_LAST_SEEN
@@ -57,7 +91,6 @@ async def receive_data(request: Request):
 async def get_data():
     return {"status": "ok", "vps_last_seen": VPS_LAST_SEEN, **LIVE_DATA}
 
-# 2. Live Chart Streaming
 @app.post("/api/update_chart")
 @app.post("/api/update_visuals")
 async def update_chart(request: Request):
@@ -93,7 +126,9 @@ async def get_chart_data(symbol: str = "XAUUSD"):
         "online": bool(CHART_DATA.get("candles"))
     }
 
-# 3. Direct Trade Execution
+# ==============================================================================
+# TRADE EXECUTION
+# ==============================================================================
 @app.post("/api/execute_trade")
 async def execute_trade(request: Request):
     global PENDING_COMMANDS
@@ -121,7 +156,9 @@ async def get_pending_trade():
             break
     return {"trade": trade}
 
-# 4. Alerts & Commands
+# ==============================================================================
+# ALERTS & COMMANDS
+# ==============================================================================
 @app.post("/api/alerts")
 async def create_alert(request: Request):
     data = await request.json()
