@@ -11,8 +11,12 @@ ACTIVE_ALERTS = []
 PENDING_COMMANDS = []
 VPS_LAST_SEEN = ""
 
-CHART_CONFIG = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER", "cache_size": 0}
+CHART_CONFIG = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER"}
 CHART_DATA = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER", "candles": [], "visuals": {}, "updated_at": ""}
+
+# Local Cache to store candles per symbol_timeframe
+CANDLE_CACHE = {}
+
 PENDING_HISTORY = None
 HISTORY_RESPONSE = []
 
@@ -25,11 +29,11 @@ async def set_chart_config(request: Request):
     CHART_CONFIG["timeframe"] = data.get("timeframe", "M5")
     CHART_CONFIG["accountId"] = data.get("accountId", "MASTER")
     
-    # React tells us how many candles it already has in its cache
-    CHART_CONFIG["cache_size"] = data.get("cache_size", 0)
-    
-    # If React cache is 0, wipe Render's chart data so React doesn't get stale data
-    if CHART_CONFIG["cache_size"] == 0:
+    # Check if React has cached this timeframe. If yes, load from Render's cache.
+    cache_key = f"{CHART_CONFIG['symbol']}_{CHART_CONFIG['timeframe']}"
+    if cache_key in CANDLE_CACHE and len(CANDLE_CACHE[cache_key]) > 0:
+        CHART_DATA["candles"] = CANDLE_CACHE[cache_key]
+    else:
         CHART_DATA["candles"] = []
         
     CHART_DATA["timeframe"] = CHART_CONFIG["timeframe"]
@@ -37,13 +41,14 @@ async def set_chart_config(request: Request):
     
     return {"status": "ok", "config": CHART_CONFIG}
 
+# THE FIX IS HERE: Dynamically calculate the cache size based on actual data held
 @app.get("/api/chart_config")
 async def get_chart_config(): 
-    return CHART_CONFIG
+    return {**CHART_CONFIG, "cache_size": len(CHART_DATA.get("candles", []))}
 
 @app.post("/api/update_chart")
 async def update_chart(request: Request):
-    global CHART_DATA
+    global CHART_DATA, CANDLE_CACHE
     data = await request.json()
     
     if data:
@@ -61,7 +66,11 @@ async def update_chart(request: Request):
                         CHART_DATA["candles"][-1] = c # Update live candle
                     elif c["time"] > CHART_DATA["candles"][-1]["time"]:
                         CHART_DATA["candles"].append(c) # Append new candle
-                        
+            
+            # Save to cache
+            cache_key = f"{CHART_DATA['symbol']}_{CHART_DATA['timeframe']}"
+            CANDLE_CACHE[cache_key] = CHART_DATA["candles"]
+            
         CHART_DATA["updated_at"] = datetime.utcnow().isoformat()
     return {"status": "ok"}
 
