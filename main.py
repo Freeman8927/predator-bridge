@@ -11,7 +11,7 @@ ACTIVE_ALERTS = []
 PENDING_COMMANDS = []
 VPS_LAST_SEEN = ""
 
-CHART_CONFIG = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER"}
+CHART_CONFIG = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER", "cache_size": 0}
 CHART_DATA = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER", "candles": [], "visuals": {}, "updated_at": ""}
 PENDING_HISTORY = None
 HISTORY_RESPONSE = []
@@ -21,20 +21,49 @@ async def set_chart_config(request: Request):
     global CHART_CONFIG, CHART_DATA
     data = await request.json()
     
-    # Update config
     CHART_CONFIG["symbol"] = data.get("symbol", "XAUUSD")
     CHART_CONFIG["timeframe"] = data.get("timeframe", "M5")
     CHART_CONFIG["accountId"] = data.get("accountId", "MASTER")
     
-    # CRITICAL FIX: Wipe old candles so React doesn't get stale M30 data
-    CHART_DATA["candles"] = []
+    # React tells us how many candles it already has in its cache
+    CHART_CONFIG["cache_size"] = data.get("cache_size", 0)
+    
+    # If React cache is 0, wipe Render's chart data so React doesn't get stale data
+    if CHART_CONFIG["cache_size"] == 0:
+        CHART_DATA["candles"] = []
+        
     CHART_DATA["timeframe"] = CHART_CONFIG["timeframe"]
     CHART_DATA["symbol"] = CHART_CONFIG["symbol"]
     
     return {"status": "ok", "config": CHART_CONFIG}
 
 @app.get("/api/chart_config")
-async def get_chart_config(): return CHART_CONFIG
+async def get_chart_config(): 
+    return CHART_CONFIG
+
+@app.post("/api/update_chart")
+async def update_chart(request: Request):
+    global CHART_DATA
+    data = await request.json()
+    
+    if data:
+        if "symbol" in data: CHART_DATA["symbol"] = data["symbol"]
+        if "timeframe" in data: CHART_DATA["timeframe"] = data["timeframe"]
+        if "accountId" in data: CHART_DATA["accountId"] = data["accountId"]
+        
+        incoming_candles = data.get("candles", [])
+        if incoming_candles:
+            if not CHART_DATA["candles"]:
+                CHART_DATA["candles"] = incoming_candles
+            else:
+                for c in incoming_candles:
+                    if c["time"] == CHART_DATA["candles"][-1]["time"]:
+                        CHART_DATA["candles"][-1] = c # Update live candle
+                    elif c["time"] > CHART_DATA["candles"][-1]["time"]:
+                        CHART_DATA["candles"].append(c) # Append new candle
+                        
+        CHART_DATA["updated_at"] = datetime.utcnow().isoformat()
+    return {"status": "ok"}
 
 @app.post("/api/request_history")
 async def request_history(request: Request):
@@ -76,18 +105,6 @@ async def receive_data(request: Request):
 
 @app.get("/api/data")
 async def get_data(): return {"status": "ok", "vps_last_seen": VPS_LAST_SEEN, **LIVE_DATA}
-
-@app.post("/api/update_chart")
-async def update_chart(request: Request):
-    global CHART_DATA
-    data = await request.json()
-    if data:
-        if "symbol" in data: CHART_DATA["symbol"] = data["symbol"]
-        if "timeframe" in data: CHART_DATA["timeframe"] = data["timeframe"]
-        if "accountId" in data: CHART_DATA["accountId"] = data["accountId"]
-        if "candles" in data: CHART_DATA["candles"] = data["candles"]
-        CHART_DATA["updated_at"] = datetime.utcnow().isoformat()
-    return {"status": "ok"}
 
 @app.get("/api/chart_data")
 async def get_chart_data(symbol: str = "XAUUSD"):
