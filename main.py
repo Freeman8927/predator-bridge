@@ -35,7 +35,7 @@ app.add_middleware(
 )
 
 # ==============================================================================
-# PYDANTIC MODELS — request validation (P1)
+# PYDANTIC MODELS — request validation
 # ==============================================================================
 class ChartConfig(BaseModel):
     symbol: str = Field(default="XAUUSD", max_length=20)
@@ -121,7 +121,7 @@ HISTORY_EXHAUSTED: bool = False
 FILL_ECHOES: List[Dict[str, Any]] = []  # last N fills, served to frontend
 
 # ==============================================================================
-# RATE LIMITING — per-IP (P1)
+# RATE LIMITING — per-IP
 # ==============================================================================
 _rate_buckets: Dict[str, List[float]] = defaultdict(list)
 RATE_LIMIT_WINDOW = 1.0   # seconds
@@ -140,7 +140,7 @@ async def rate_limit(request: Request, max_requests: int = RATE_LIMIT_MAX):
     bucket.append(now)
 
 async def bridge_auth(request: Request):
-    """Optional bridge authentication (P1-1)."""
+    """Optional bridge authentication."""
     if not BRIDGE_API_KEY:
         return
     key = request.headers.get("X-Bridge-Key", "")
@@ -148,7 +148,7 @@ async def bridge_auth(request: Request):
         raise HTTPException(status_code=401, detail="Invalid bridge key")
 
 # ==============================================================================
-# CHART ENDPOINTS (P0-4: canonical + legacy aliases)
+# CHART ENDPOINTS
 # ==============================================================================
 @app.get("/api/chart/config")
 async def get_chart_config(_: None = Depends(rate_limit)):
@@ -161,8 +161,11 @@ async def get_chart_config_legacy(_: None = Depends(rate_limit)):
 @app.put("/api/chart/config")
 async def put_chart_config(cfg: ChartConfig, _: None = Depends(rate_limit)):
     async with _state_lock:
+        # ONLY clear candles if the symbol or timeframe actually changed
+        if CHART_CONFIG["symbol"] != cfg.symbol or CHART_CONFIG["timeframe"] != cfg.timeframe:
+            CHART_DATA["candles"] = []
+            
         CHART_CONFIG.update(cfg.model_dump())
-        CHART_DATA["candles"] = []
         CHART_DATA["symbol"] = CHART_CONFIG["symbol"]
         CHART_DATA["timeframe"] = CHART_CONFIG["timeframe"]
     return {"status": "ok", "config": CHART_CONFIG}
@@ -220,7 +223,7 @@ async def get_chart_data_legacy(symbol: str = "XAUUSD", _: None = Depends(rate_l
     return await get_chart_data(symbol)
 
 # ==============================================================================
-# HISTORY (P0: 202 pending / 200 ready / 200 empty exhausted)
+# HISTORY (202 pending / 200 ready / 200 empty exhausted)
 # ==============================================================================
 @app.post("/api/request_history")
 async def request_history(req: HistoryRequest, _: None = Depends(rate_limit)):
@@ -300,14 +303,14 @@ async def get_pending_trade(_: None = Depends(bridge_auth)):
     return {"trade": trade}
 
 # ==============================================================================
-# ALERTS (P0-2: server-assigned id + clientRef)
+# ALERTS (Server-assigned id + clientRef)
 # ==============================================================================
 @app.post("/api/alerts")
 async def create_alert(alert: AlertCreate, _: None = Depends(rate_limit)):
     global ACTIVE_ALERTS
     async with _state_lock:
         new_alert = {
-            "id": str(uuid.uuid4()),  # SERVER-ASSIGNED — never the client's id
+            "id": str(uuid.uuid4()),  # SERVER-ASSIGNED
             "clientRef": alert.id,     # echo back so frontend can map
             "symbol": alert.symbol.upper(),
             "price": float(alert.price),
@@ -331,7 +334,7 @@ async def delete_alert(alert_id: str, _: None = Depends(bridge_auth)):
     return {"status": "deleted"}
 
 # ==============================================================================
-# FILL ECHO (P0-1)
+# FILL ECHO
 # ==============================================================================
 @app.post("/api/fill")
 async def fill_echo(fill: FillEcho, _: None = Depends(bridge_auth)):
