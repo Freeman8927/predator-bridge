@@ -22,7 +22,7 @@ import uvicorn
 # CONFIG
 # ==============================================================================
 APP_VERSION = "2.5.0"
-BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "")  # optional; set in Render env
+BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "")
 
 app = FastAPI(title="Market Predator Cloud Bridge", version=APP_VERSION)
 
@@ -35,7 +35,7 @@ app.add_middleware(
 )
 
 # ==============================================================================
-# PYDANTIC MODELS — request validation
+# PYDANTIC MODELS
 # ==============================================================================
 class ChartConfig(BaseModel):
     symbol: str = Field(default="XAUUSD", max_length=20)
@@ -66,7 +66,7 @@ class ExecuteTrade(BaseModel):
     accountId: str = Field(default="MASTER")
 
 class AlertCreate(BaseModel):
-    id: Optional[str] = None  # clientRef; server assigns canonical id
+    id: Optional[str] = None
     symbol: str
     price: float
     condition: str = Field(pattern=r"^(above|below|crosses)$")
@@ -97,9 +97,11 @@ class WebhookPayload(BaseModel):
     bid: Optional[float] = None
     ask: Optional[float] = None
     positions: List[Dict[str, Any]] = Field(default_factory=list)
+    lastMessage: Optional[str] = ""         # <-- NEW
+    lastMessageAt: Optional[float] = 0.0    # <-- NEW
 
 # ==============================================================================
-# IN-MEMORY STATE (thread-safe via asyncio.Lock for writes)
+# IN-MEMORY STATE
 # ==============================================================================
 _state_lock = asyncio.Lock()
 
@@ -118,21 +120,20 @@ PENDING_HISTORY: Optional[Dict[str, Any]] = None
 HISTORY_RESPONSE: List[Dict[str, Any]] = []
 HISTORY_EXHAUSTED: bool = False
 
-FILL_ECHOES: List[Dict[str, Any]] = []  # last N fills, served to frontend
+FILL_ECHOES: List[Dict[str, Any]] = []
 
 # ==============================================================================
-# RATE LIMITING — per-IP
+# RATE LIMITING & AUTH
 # ==============================================================================
 _rate_buckets: Dict[str, List[float]] = defaultdict(list)
-RATE_LIMIT_WINDOW = 1.0   # seconds
-RATE_LIMIT_MAX = 10       # requests per window per IP
-RATE_LIMIT_MAX_BRIDGE = 60  # bridge is one IP, allow more
+RATE_LIMIT_WINDOW = 1.0
+RATE_LIMIT_MAX = 10
+RATE_LIMIT_MAX_BRIDGE = 60
 
 async def rate_limit(request: Request, max_requests: int = RATE_LIMIT_MAX):
     ip = request.client.host if request.client else "unknown"
     now = time.monotonic()
     bucket = _rate_buckets[ip]
-    # prune old
     while bucket and bucket[0] < now - RATE_LIMIT_WINDOW:
         bucket.pop(0)
     if len(bucket) >= max_requests:
@@ -140,7 +141,6 @@ async def rate_limit(request: Request, max_requests: int = RATE_LIMIT_MAX):
     bucket.append(now)
 
 async def bridge_auth(request: Request):
-    """Optional bridge authentication."""
     if not BRIDGE_API_KEY:
         return
     key = request.headers.get("X-Bridge-Key", "")
@@ -161,7 +161,6 @@ async def get_chart_config_legacy(_: None = Depends(rate_limit)):
 @app.put("/api/chart/config")
 async def put_chart_config(cfg: ChartConfig, _: None = Depends(rate_limit)):
     async with _state_lock:
-        # ONLY clear candles if the symbol or timeframe actually changed
         if CHART_CONFIG["symbol"] != cfg.symbol or CHART_CONFIG["timeframe"] != cfg.timeframe:
             CHART_DATA["candles"] = []
             
@@ -223,7 +222,7 @@ async def get_chart_data_legacy(symbol: str = "XAUUSD", _: None = Depends(rate_l
     return await get_chart_data(symbol)
 
 # ==============================================================================
-# HISTORY (202 pending / 200 ready / 200 empty exhausted)
+# HISTORY
 # ==============================================================================
 @app.post("/api/request_history")
 async def request_history(req: HistoryRequest, _: None = Depends(rate_limit)):
@@ -303,15 +302,15 @@ async def get_pending_trade(_: None = Depends(bridge_auth)):
     return {"trade": trade}
 
 # ==============================================================================
-# ALERTS (Server-assigned id + clientRef)
+# ALERTS
 # ==============================================================================
 @app.post("/api/alerts")
 async def create_alert(alert: AlertCreate, _: None = Depends(rate_limit)):
     global ACTIVE_ALERTS
     async with _state_lock:
         new_alert = {
-            "id": str(uuid.uuid4()),  # SERVER-ASSIGNED
-            "clientRef": alert.id,     # echo back so frontend can map
+            "id": str(uuid.uuid4()),
+            "clientRef": alert.id,
             "symbol": alert.symbol.upper(),
             "price": float(alert.price),
             "condition": alert.condition,
@@ -356,8 +355,5 @@ async def get_fills(_: None = Depends(rate_limit)):
 def health_check():
     return {"status": "running", "version": APP_VERSION}
 
-# ==============================================================================
-# ENTRYPOINT (for local dev; Render uses `uvicorn main:app`)
-# ==============================================================================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
