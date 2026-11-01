@@ -173,9 +173,19 @@ def _infer_timeframe_from_candles(candles: List[Dict[str, Any]]) -> Optional[str
         return None
     gaps.sort()
     median = gaps[len(gaps) // 2]
+    
+    # Find the closest matching timeframe by absolute difference
+    best_tf = None
+    best_diff = float('inf')
     for tf, secs in TF_SECONDS.items():
-        if secs * 0.5 <= median <= secs * 2:
-            return tf
+        diff = abs(median - secs)
+        if diff < best_diff:
+            best_diff = diff
+            best_tf = tf
+            
+    # Only accept if the median is within 10% of the target timeframe
+    if best_tf and best_diff <= TF_SECONDS[best_tf] * 0.1:
+        return best_tf
     return None
 
 # ==============================================================================
