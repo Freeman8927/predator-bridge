@@ -126,6 +126,9 @@ HISTORY_META: Dict[str, str] = {"symbol": "", "timeframe": ""}
 
 FILL_ECHOES: List[Dict[str, Any]] = []
 
+# EA WAKE-UP STATE
+WAKE_EA_TIMEOUT: float = 0.0
+
 # ==============================================================================
 # RATE LIMITING & AUTH
 # ==============================================================================
@@ -201,12 +204,6 @@ async def get_chart_config_legacy(_: None = Depends(rate_limit)):
 
 @app.put("/api/chart/config")
 async def put_chart_config(cfg: ChartConfig, _: None = Depends(rate_limit)):
-    """
-    Record the *requested* config. On any change, clear candles so the VPS
-    sees cache_size=0 on its next poll and fetches a full 300-bar history
-    for the new config. Do NOT re-claim CHART_DATA's identity — that must
-    only be set by a real candle push from the VPS.
-    """
     async with _state_lock:
         config_changed = (
             CHART_CONFIG["symbol"] != cfg.symbol.upper()
@@ -232,7 +229,6 @@ async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit))
         push_acc = update.accountId or CHART_CONFIG["accountId"]
 
         if update.candles:
-            # Guard 1: explicit config mismatch
             if (
                 push_symbol != CHART_CONFIG["symbol"].upper()
                 or push_tf != CHART_CONFIG["timeframe"]
@@ -244,7 +240,6 @@ async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit))
                     "current": {k: CHART_CONFIG[k] for k in ("symbol", "timeframe", "accountId")},
                 }
 
-            # Guard 2: candle spacing mismatch (VPS didn't echo or echoed wrong)
             inferred = _infer_timeframe_from_candles(update.candles)
             if inferred and inferred != push_tf:
                 return {
@@ -254,7 +249,6 @@ async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit))
                     "config": push_tf,
                 }
 
-            # Reset if stored data belonged to a different config
             if (
                 CHART_DATA.get("symbol") != push_symbol
                 or CHART_DATA.get("timeframe") != push_tf
@@ -265,7 +259,6 @@ async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit))
                 CHART_DATA["candles"] = []
                 CHART_DATA["visuals"] = {}
 
-            # Merge
             if not CHART_DATA["candles"]:
                 CHART_DATA["candles"] = sorted(
                     update.candles, key=lambda c: c.get("time", 0)
@@ -282,7 +275,6 @@ async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit))
                         CHART_DATA["candles"].append(c)
                         last_time = t
                     else:
-                        # Replace a recent bar if VPS resent a corrected version
                         for i in range(
                             len(CHART_DATA["candles"]) - 1,
                             max(-1, len(CHART_DATA["candles"]) - 21),
@@ -335,8 +327,6 @@ async def get_chart_data_legacy(
     accountId: str = "MASTER",
     _: None = Depends(rate_limit),
 ):
-    # Bug fix: timeframe & accountId were silently dropped by FastAPI, so
-    # this endpoint always returned CHART_DATA as-is regardless of request.
     return _build_chart_data_response(symbol, timeframe, accountId)
 
 # ==============================================================================
@@ -376,9 +366,6 @@ async def get_history_response(
 ):
     global HISTORY_RESPONSE, HISTORY_EXHAUSTED
     async with _state_lock:
-        # If the caller asked for a specific key and the stored response
-        # belongs to a different one, keep them polling rather than handing
-        # them candles from the wrong timeframe.
         if symbol and HISTORY_META["symbol"] and HISTORY_META["symbol"] != symbol.upper():
             return JSONResponse(
                 status_code=202,
@@ -446,6 +433,24 @@ async def get_pending_trade(_: None = Depends(bridge_auth)):
         if trade:
             PENDING_COMMANDS.remove(trade)
     return {"trade": trade}
+
+# ==============================================================================
+# EA WAKE-UP (Pulse for Local Python VPS)
+# ==============================================================================
+@app.post("/api/wake_ea")
+async def wake_ea(_: None = Depends(rate_limit)):
+    global WAKE_EA_TIMEOUT
+    async with _state_lock:
+        WAKE_EA_TIMEOUT = time.time() + 5.0  # Keeps the flag active for 5 seconds
+    return {"status": "pinged"}
+
+@app.get("/api/check_wake_ea")
+async def check_wake_ea(_: None = Depends(rate_limit)):
+    global WAKE_EA_TIMEOUT
+    async with _state_lock:
+        if time.time() < WAKE_EA_TIMEOUT:
+            return {"wake": True}
+    return {"wake": False}
 
 # ==============================================================================
 # ALERTS
