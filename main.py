@@ -21,7 +21,7 @@ import uvicorn
 # ==============================================================================
 # CONFIG
 # ==============================================================================
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "")
 
 app = FastAPI(title="Market Predator Cloud Bridge", version=APP_VERSION)
@@ -97,8 +97,8 @@ class WebhookPayload(BaseModel):
     bid: Optional[float] = None
     ask: Optional[float] = None
     positions: List[Dict[str, Any]] = Field(default_factory=list)
-    lastMessage: Optional[str] = ""         # <-- NEW
-    lastMessageAt: Optional[float] = 0.0    # <-- NEW
+    lastMessage: Optional[str] = ""
+    lastMessageAt: Optional[float] = 0.0
 
 # ==============================================================================
 # IN-MEMORY STATE
@@ -108,9 +108,12 @@ _state_lock = asyncio.Lock()
 LIVE_DATA: Dict[str, Any] = {"accounts": {}, "timestamp": ""}
 VPS_LAST_SEEN: str = ""
 
+# CHART_CONFIG = what the frontend has REQUESTED. Does NOT imply we have data.
 CHART_CONFIG: Dict[str, Any] = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER"}
+
+# CHART_DATA = what we ACTUALLY have. symbol/timeframe reflect the last real push.
 CHART_DATA: Dict[str, Any] = {
-    "symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER",
+    "symbol": "", "timeframe": "", "accountId": "",
     "candles": [], "visuals": {}, "updated_at": "",
 }
 
@@ -119,6 +122,7 @@ PENDING_COMMANDS: List[Dict[str, Any]] = []
 PENDING_HISTORY: Optional[Dict[str, Any]] = None
 HISTORY_RESPONSE: List[Dict[str, Any]] = []
 HISTORY_EXHAUSTED: bool = False
+HISTORY_META: Dict[str, str] = {"symbol": "", "timeframe": ""}
 
 FILL_ECHOES: List[Dict[str, Any]] = []
 
@@ -148,6 +152,33 @@ async def bridge_auth(request: Request):
         raise HTTPException(status_code=401, detail="Invalid bridge key")
 
 # ==============================================================================
+# TIMEFRAME HELPERS
+# ==============================================================================
+TF_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400,
+}
+
+def _infer_timeframe_from_candles(candles: List[Dict[str, Any]]) -> Optional[str]:
+    """Best-effort timeframe inference from candle spacing (defense-in-depth)."""
+    if len(candles) < 2:
+        return None
+    tail = candles[-10:]
+    gaps = []
+    for i in range(len(tail) - 1):
+        t1, t2 = tail[i].get("time"), tail[i + 1].get("time")
+        if isinstance(t1, (int, float)) and isinstance(t2, (int, float)) and t2 > t1:
+            gaps.append(t2 - t1)
+    if not gaps:
+        return None
+    gaps.sort()
+    median = gaps[len(gaps) // 2]
+    for tf, secs in TF_SECONDS.items():
+        if secs * 0.5 <= median <= secs * 2:
+            return tf
+    return None
+
+# ==============================================================================
 # CHART ENDPOINTS
 # ==============================================================================
 @app.get("/api/chart/config")
@@ -160,13 +191,23 @@ async def get_chart_config_legacy(_: None = Depends(rate_limit)):
 
 @app.put("/api/chart/config")
 async def put_chart_config(cfg: ChartConfig, _: None = Depends(rate_limit)):
+    """
+    Record the *requested* config. On any change, clear candles so the VPS
+    sees cache_size=0 on its next poll and fetches a full 300-bar history
+    for the new config. Do NOT re-claim CHART_DATA's identity — that must
+    only be set by a real candle push from the VPS.
+    """
     async with _state_lock:
-        if CHART_CONFIG["symbol"] != cfg.symbol or CHART_CONFIG["timeframe"] != cfg.timeframe:
+        config_changed = (
+            CHART_CONFIG["symbol"] != cfg.symbol.upper()
+            or CHART_CONFIG["timeframe"] != cfg.timeframe
+            or CHART_CONFIG["accountId"] != cfg.accountId
+        )
+        if config_changed:
             CHART_DATA["candles"] = []
-            
+            CHART_DATA["visuals"] = {}
+
         CHART_CONFIG.update(cfg.model_dump())
-        CHART_DATA["symbol"] = CHART_CONFIG["symbol"]
-        CHART_DATA["timeframe"] = CHART_CONFIG["timeframe"]
     return {"status": "ok", "config": CHART_CONFIG}
 
 @app.post("/api/set_chart_config", include_in_schema=False)
@@ -176,26 +217,71 @@ async def set_chart_config_legacy(cfg: ChartConfig, _: None = Depends(rate_limit
 @app.patch("/api/chart/config")
 async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit)):
     async with _state_lock:
-        if update.symbol:
-            CHART_DATA["symbol"] = update.symbol
-        if update.timeframe:
-            CHART_DATA["timeframe"] = update.timeframe
-        if update.accountId:
-            CHART_DATA["accountId"] = update.accountId
+        push_symbol = (update.symbol or CHART_CONFIG["symbol"]).upper()
+        push_tf = update.timeframe or CHART_CONFIG["timeframe"]
+        push_acc = update.accountId or CHART_CONFIG["accountId"]
 
         if update.candles:
+            # Guard 1: explicit config mismatch
+            if (
+                push_symbol != CHART_CONFIG["symbol"].upper()
+                or push_tf != CHART_CONFIG["timeframe"]
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "config_mismatch",
+                    "push": {"symbol": push_symbol, "timeframe": push_tf},
+                    "current": {k: CHART_CONFIG[k] for k in ("symbol", "timeframe", "accountId")},
+                }
+
+            # Guard 2: candle spacing mismatch (VPS didn't echo or echoed wrong)
+            inferred = _infer_timeframe_from_candles(update.candles)
+            if inferred and inferred != push_tf:
+                return {
+                    "status": "ignored",
+                    "reason": "timeframe_mismatch",
+                    "inferred": inferred,
+                    "config": push_tf,
+                }
+
+            # Reset if stored data belonged to a different config
+            if (
+                CHART_DATA.get("symbol") != push_symbol
+                or CHART_DATA.get("timeframe") != push_tf
+            ):
+                CHART_DATA["symbol"] = push_symbol
+                CHART_DATA["timeframe"] = push_tf
+                CHART_DATA["accountId"] = push_acc
+                CHART_DATA["candles"] = []
+                CHART_DATA["visuals"] = {}
+
+            # Merge
             if not CHART_DATA["candles"]:
-                CHART_DATA["candles"] = update.candles
+                CHART_DATA["candles"] = sorted(
+                    update.candles, key=lambda c: c.get("time", 0)
+                )
             else:
+                last_time = CHART_DATA["candles"][-1].get("time", 0)
                 for c in update.candles:
                     t = c.get("time")
                     if t is None:
                         continue
-                    last = CHART_DATA["candles"][-1]
-                    if t == last.get("time"):
+                    if t == last_time:
                         CHART_DATA["candles"][-1] = c
-                    elif t > last.get("time", 0):
+                    elif t > last_time:
                         CHART_DATA["candles"].append(c)
+                        last_time = t
+                    else:
+                        # Replace a recent bar if VPS resent a corrected version
+                        for i in range(
+                            len(CHART_DATA["candles"]) - 1,
+                            max(-1, len(CHART_DATA["candles"]) - 21),
+                            -1,
+                        ):
+                            if CHART_DATA["candles"][i].get("time") == t:
+                                CHART_DATA["candles"][i] = c
+                                break
+
         if update.visuals is not None:
             CHART_DATA["visuals"] = update.visuals
         CHART_DATA["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -205,32 +291,55 @@ async def patch_chart_config(update: ChartUpdate, _: None = Depends(rate_limit))
 async def update_chart_legacy(update: ChartUpdate, _: None = Depends(rate_limit)):
     return await patch_chart_config(update)
 
-@app.get("/api/chart/data")
-async def get_chart_data(symbol: str = "XAUUSD", _: None = Depends(rate_limit)):
+def _build_chart_data_response(symbol: str, timeframe: str, accountId: str) -> Dict[str, Any]:
+    stored_symbol = CHART_DATA.get("symbol") or ""
+    stored_tf = CHART_DATA.get("timeframe") or ""
+    matches = (stored_symbol == symbol.upper()) and (stored_tf == timeframe)
+
     return {
         "status": "ok",
-        "symbol": CHART_DATA.get("symbol", symbol),
-        "timeframe": CHART_DATA.get("timeframe", "M5"),
-        "accountId": CHART_DATA.get("accountId", "MASTER"),
-        "candles": CHART_DATA.get("candles", []),
-        "visuals": CHART_DATA.get("visuals", {}),
-        "online": bool(CHART_DATA.get("candles")),
+        "symbol": stored_symbol or symbol.upper(),
+        "timeframe": stored_tf or timeframe,
+        "accountId": CHART_DATA.get("accountId") or accountId,
+        "requested_symbol": symbol.upper(),
+        "requested_timeframe": timeframe,
+        "matches": matches,
+        "candles": CHART_DATA.get("candles", []) if matches else [],
+        "visuals": CHART_DATA.get("visuals", {}) if matches else {},
+        "online": bool(CHART_DATA.get("candles")) and matches,
     }
 
+@app.get("/api/chart/data")
+async def get_chart_data(
+    symbol: str = "XAUUSD",
+    timeframe: str = "M5",
+    accountId: str = "MASTER",
+    _: None = Depends(rate_limit),
+):
+    return _build_chart_data_response(symbol, timeframe, accountId)
+
 @app.get("/api/chart_data", include_in_schema=False)
-async def get_chart_data_legacy(symbol: str = "XAUUSD", _: None = Depends(rate_limit)):
-    return await get_chart_data(symbol)
+async def get_chart_data_legacy(
+    symbol: str = "XAUUSD",
+    timeframe: str = "M5",
+    accountId: str = "MASTER",
+    _: None = Depends(rate_limit),
+):
+    # Bug fix: timeframe & accountId were silently dropped by FastAPI, so
+    # this endpoint always returned CHART_DATA as-is regardless of request.
+    return _build_chart_data_response(symbol, timeframe, accountId)
 
 # ==============================================================================
 # HISTORY
 # ==============================================================================
 @app.post("/api/request_history")
 async def request_history(req: HistoryRequest, _: None = Depends(rate_limit)):
-    global PENDING_HISTORY, HISTORY_RESPONSE, HISTORY_EXHAUSTED
+    global PENDING_HISTORY, HISTORY_RESPONSE, HISTORY_EXHAUSTED, HISTORY_META
     async with _state_lock:
         PENDING_HISTORY = req.model_dump()
         HISTORY_RESPONSE = []
         HISTORY_EXHAUSTED = False
+        HISTORY_META = {"symbol": req.symbol.upper(), "timeframe": req.timeframe}
     return {"status": "requested"}
 
 @app.get("/api/pending_history")
@@ -242,23 +351,47 @@ async def get_pending_history(_: None = Depends(bridge_auth)):
 
 @app.post("/api/history_response")
 async def post_history_response(resp: HistoryResponse, _: None = Depends(bridge_auth)):
-    global HISTORY_RESPONSE, HISTORY_EXHAUSTED
+    global HISTORY_RESPONSE, HISTORY_EXHAUSTED, HISTORY_META
     async with _state_lock:
         HISTORY_RESPONSE = resp.candles
+        HISTORY_META = {"symbol": resp.symbol.upper(), "timeframe": resp.timeframe}
         HISTORY_EXHAUSTED = len(resp.candles) == 0
     return {"status": "ok"}
 
 @app.get("/api/history_response")
-async def get_history_response(_: None = Depends(rate_limit)):
+async def get_history_response(
+    symbol: Optional[str] = None,
+    timeframe: Optional[str] = None,
+    _: None = Depends(rate_limit),
+):
     global HISTORY_RESPONSE, HISTORY_EXHAUSTED
     async with _state_lock:
+        # If the caller asked for a specific key and the stored response
+        # belongs to a different one, keep them polling rather than handing
+        # them candles from the wrong timeframe.
+        if symbol and HISTORY_META["symbol"] and HISTORY_META["symbol"] != symbol.upper():
+            return JSONResponse(
+                status_code=202,
+                content={"status": "pending", "reason": "symbol_mismatch"},
+            )
+        if timeframe and HISTORY_META["timeframe"] and HISTORY_META["timeframe"] != timeframe:
+            return JSONResponse(
+                status_code=202,
+                content={"status": "pending", "reason": "timeframe_mismatch"},
+            )
+
         if HISTORY_EXHAUSTED:
-            return JSONResponse(status_code=200, content={"status": "exhausted", "candles": []})
+            return JSONResponse(
+                status_code=200,
+                content={"status": "exhausted", "candles": [], **HISTORY_META},
+            )
         if not HISTORY_RESPONSE:
             return JSONResponse(status_code=202, content={"status": "pending"})
+
         data = HISTORY_RESPONSE
+        meta = dict(HISTORY_META)
         HISTORY_RESPONSE = []
-        return {"status": "ok", "candles": data}
+        return {"status": "ok", "candles": data, **meta}
 
 # ==============================================================================
 # TELEMETRY / DATA
@@ -296,7 +429,10 @@ async def execute_trade(trade: ExecuteTrade, _: None = Depends(rate_limit)):
 async def get_pending_trade(_: None = Depends(bridge_auth)):
     global PENDING_COMMANDS
     async with _state_lock:
-        trade = next((c for c in PENDING_COMMANDS if c.get("action") in ("BUY", "SELL")), None)
+        trade = next(
+            (c for c in PENDING_COMMANDS if c.get("action") in ("BUY", "SELL")),
+            None,
+        )
         if trade:
             PENDING_COMMANDS.remove(trade)
     return {"trade": trade}
@@ -356,4 +492,9 @@ def health_check():
     return {"status": "running", "version": APP_VERSION}
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=False,
+    )
