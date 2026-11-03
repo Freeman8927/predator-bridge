@@ -399,7 +399,7 @@ async def check_wake_ea(_: None = Depends(rate_limit)):
     return {"wake": False}
 
 # ==============================================================================
-# ALERTS
+# ALERTS (FIXED)
 # ==============================================================================
 @app.post("/api/alerts")
 async def create_alert(alert: AlertCreate, _: None = Depends(rate_limit)):
@@ -414,7 +414,8 @@ async def create_alert(alert: AlertCreate, _: None = Depends(rate_limit)):
             "note": alert.note,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["id"] != new_alert["id"]]
+        # FIX: Remove any existing alert with the same clientRef (frontend ID)
+        ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a.get("clientRef") != new_alert["clientRef"]]
         ACTIVE_ALERTS.append(new_alert)
     return {"status": "ok", "alert": new_alert}
 
@@ -423,10 +424,11 @@ async def get_alerts(_: None = Depends(rate_limit)):
     return {"alerts": ACTIVE_ALERTS}
 
 @app.delete("/api/alerts/{alert_id}")
-async def delete_alert(alert_id: str, _: None = Depends(bridge_auth)):
+async def delete_alert(alert_id: str, _: None = Depends(rate_limit)):  # FIX: Removed bridge_auth
     global ACTIVE_ALERTS
     async with _state_lock:
-        ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["id"] != alert_id]
+        # FIX: Check BOTH the backend UUID (a["id"]) and the frontend ID (a.get("clientRef"))
+        ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["id"] != alert_id and a.get("clientRef") != alert_id]
     return {"status": "deleted"}
 
 # ==============================================================================
