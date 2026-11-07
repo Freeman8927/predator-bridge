@@ -108,10 +108,8 @@ _state_lock = asyncio.Lock()
 LIVE_DATA: Dict[str, Any] = {"accounts": {}, "timestamp": ""}
 VPS_LAST_SEEN: str = ""
 
-# CHART_CONFIG = what the frontend has REQUESTED. Does NOT imply we have data.
 CHART_CONFIG: Dict[str, Any] = {"symbol": "XAUUSD", "timeframe": "M5", "accountId": "MASTER"}
 
-# CHART_DATA = what we ACTUALLY have. symbol/timeframe reflect the last real push.
 CHART_DATA: Dict[str, Any] = {
     "symbol": "", "timeframe": "", "accountId": "",
     "candles": [], "visuals": {}, "updated_at": "",
@@ -126,7 +124,9 @@ HISTORY_META: Dict[str, str] = {"symbol": "", "timeframe": ""}
 
 FILL_ECHOES: List[Dict[str, Any]] = []
 
-# EA WAKE-UP STATE
+# NEW: Stores the dynamic symbol list from the VPS
+AVAILABLE_SYMBOLS: List[str] = ["XAUUSD", "BTCUSD", "EURUSD"]
+
 WAKE_EA_TIMEOUT: float = 0.0
 
 # ==============================================================================
@@ -189,6 +189,22 @@ def _infer_timeframe_from_candles(candles: List[Dict[str, Any]]) -> Optional[str
     return None
 
 # ==============================================================================
+# SYMBOLS ENDPOINT (NEW)
+# ==============================================================================
+@app.post("/api/symbols")
+async def post_symbols(payload: dict, _: None = Depends(bridge_auth)):
+    global AVAILABLE_SYMBOLS
+    async with _state_lock:
+        symbols = payload.get("symbols", [])
+        if isinstance(symbols, list) and len(symbols) > 0:
+            AVAILABLE_SYMBOLS = sorted(symbols)
+    return {"status": "ok", "count": len(AVAILABLE_SYMBOLS)}
+
+@app.get("/api/symbols")
+async def get_symbols(_: None = Depends(rate_limit)):
+    return {"symbols": AVAILABLE_SYMBOLS}
+
+# ==============================================================================
 # CHART ENDPOINTS
 # ==============================================================================
 @app.get("/api/chart/config")
@@ -210,7 +226,7 @@ async def put_chart_config(cfg: ChartConfig, _: None = Depends(rate_limit)):
         if config_changed:
             CHART_DATA["candles"] = []
             CHART_DATA["visuals"] = {}
-            CHART_DATA["accountId"] = "" # FIXED: Clear the stale account ID
+            CHART_DATA["accountId"] = ""
 
         CHART_CONFIG.update(cfg.model_dump())
     return {"status": "ok", "config": CHART_CONFIG}
@@ -414,7 +430,6 @@ async def create_alert(alert: AlertCreate, _: None = Depends(rate_limit)):
             "note": alert.note,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        # FIX: Remove any existing alert with the same clientRef (frontend ID)
         ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a.get("clientRef") != new_alert["clientRef"]]
         ACTIVE_ALERTS.append(new_alert)
     return {"status": "ok", "alert": new_alert}
@@ -424,10 +439,9 @@ async def get_alerts(_: None = Depends(rate_limit)):
     return {"alerts": ACTIVE_ALERTS}
 
 @app.delete("/api/alerts/{alert_id}")
-async def delete_alert(alert_id: str, _: None = Depends(rate_limit)):  # FIX: Removed bridge_auth
+async def delete_alert(alert_id: str, _: None = Depends(rate_limit)):
     global ACTIVE_ALERTS
     async with _state_lock:
-        # FIX: Check BOTH the backend UUID (a["id"]) and the frontend ID (a.get("clientRef"))
         ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["id"] != alert_id and a.get("clientRef") != alert_id]
     return {"status": "deleted"}
 
