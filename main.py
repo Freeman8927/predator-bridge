@@ -124,7 +124,7 @@ HISTORY_META: Dict[str, str] = {"symbol": "", "timeframe": ""}
 
 FILL_ECHOES: List[Dict[str, Any]] = []
 
-# NEW: Stores the dynamic symbol list from the VPS
+# Stores the dynamic symbol list from the VPS
 AVAILABLE_SYMBOLS: List[str] = ["XAUUSD", "BTCUSD", "EURUSD"]
 
 WAKE_EA_TIMEOUT: float = 0.0
@@ -189,7 +189,7 @@ def _infer_timeframe_from_candles(candles: List[Dict[str, Any]]) -> Optional[str
     return None
 
 # ==============================================================================
-# SYMBOLS ENDPOINT (NEW)
+# SYMBOLS ENDPOINT
 # ==============================================================================
 @app.post("/api/symbols")
 async def post_symbols(payload: dict, _: None = Depends(bridge_auth)):
@@ -399,15 +399,18 @@ async def get_pending_trade(_: None = Depends(bridge_auth)):
             PENDING_COMMANDS.remove(trade)
     return {"trade": trade}
 
+# ==============================================================================
+# WAKE-UP ENDPOINTS (No Rate Limit)
+# ==============================================================================
 @app.post("/api/wake_ea")
-async def wake_ea(_: None = Depends(rate_limit)):
+async def wake_ea():
     global WAKE_EA_TIMEOUT
     async with _state_lock:
         WAKE_EA_TIMEOUT = time.time() + 5.0
     return {"status": "pinged"}
 
 @app.get("/api/check_wake_ea")
-async def check_wake_ea(_: None = Depends(rate_limit)):
+async def check_wake_ea():
     global WAKE_EA_TIMEOUT
     async with _state_lock:
         if time.time() < WAKE_EA_TIMEOUT:
